@@ -2,7 +2,7 @@
 
 Prototype exploratoire d'**IA agentique pour la recommandation personnalisée de trajets multimodaux**, réalisé en lien avec le sujet de thèse *« IA agentique pour la mobilité intelligente : recommandation personnalisée et adaptative de trajets multimodaux dans des environnements dynamiques et incertains »* (LaBRI – Chaire MTI, université de Bordeaux).
 
-**Démo en ligne :** https://VOTRE-SITE.netlify.app
+**Démo en ligne :** https://mobiagents.netlify.app
 
 ## Idée
 
@@ -10,7 +10,7 @@ Un usager décrit son besoin en langage naturel (*« Je vais de la Gare Saint-Je
 
 | Agent | Rôle | Implémentation |
 |---|---|---|
-| **Préférences** | Transformer la demande en poids sur 6 critères et en contraintes dures ; apprendre des retours de l'usager | LLM (Llama 3.3 70B via Groq) avec sortie JSON contrainte, et analyse par règles en repli |
+| **Préférences** | Transformer la demande en poids sur 6 critères et en contraintes dures ; apprendre des retours de l'usager | LLM open source via Groq (Qwen3) avec sortie JSON contrainte, et analyse par règles en repli |
 | **Environnement** | Observer l'état réel de la ville et qualifier la confiance de chaque source | V³ temps réel (Bordeaux Métropole), Open-Meteo, routage OSM, géocodage Géoplateforme/BAN |
 | **Décision et coordination** | Arbitrer entre les options, écarter celles qui sont infaisables, expliquer le choix, re-planifier en cas d'imprévu | Score multicritère contextuel, facteur de sécurité non compensatoire, hystérésis, explication générée |
 
