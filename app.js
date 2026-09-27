@@ -168,11 +168,17 @@ function drawResult() {
 /* Agent 1 — Préférences                                               */
 /* ------------------------------------------------------------------ */
 async function llm(task, body) {
-  const res = await fetchJSON("/api/agent", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ task, ...body }),
-  }, 15000);
-  if (!res.ok) throw new Error(res.error || "LLM indisponible");
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 20000);
+  let r, res;
+  try {
+    r = await fetch("/api/agent", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task, ...body }), signal: ctl.signal,
+    });
+    res = await r.json().catch(() => ({}));
+  } finally { clearTimeout(t); }
+  if (!r.ok || !res.ok) throw new Error(`HTTP ${r.status}${res.error ? " — " + res.error : ""}`);
   return res;
 }
 
