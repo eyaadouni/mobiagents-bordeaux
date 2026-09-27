@@ -42,15 +42,20 @@ Rédige en français une explication claire de 2 à 4 phrases, adressée à l'us
 pourquoi l'option recommandée, ce qu'elle coûte par rapport au trajet le plus rapide, et quelles options ont été écartées et pourquoi.
 N'invente AUCUN chiffre : utilise uniquement ceux fournis. Pas de liste, pas de markdown.`;
 
-async function callLLM(system, user, json) {
+const FALLBACK_MODELS = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"];
+let workingModel = null;
+
+function apiKey() {
+  const k = (globalThis.Netlify?.env?.get?.("LLM_API_KEY") ?? process.env.LLM_API_KEY ?? "").trim();
+  return k;
+}
+
+async function callOnce(model, system, user, json) {
   const res = await fetch(`${BASE_URL}/chat/completions`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.LLM_API_KEY}`,
-    },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey()}` },
     body: JSON.stringify({
-      model: MODEL,
+      model,
       temperature: 0.2,
       max_tokens: json ? 500 : 300,
       ...(json ? { response_format: { type: "json_object" } } : {}),
@@ -60,14 +65,45 @@ async function callLLM(system, user, json) {
       ],
     }),
   });
-  if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  if (!res.ok) {
+    const err = new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
+  }
   const data = await res.json();
   return data.choices?.[0]?.message?.content ?? "";
 }
 
+// Essaie le modèle configuré puis des modèles de secours (utile si un modèle est retiré par le fournisseur)
+async function callLLM(system, user, json) {
+  const models = [...new Set([workingModel, MODEL, ...FALLBACK_MODELS].filter(Boolean))];
+  let last;
+  for (const m of models) {
+    try {
+      const out = await callOnce(m, system, user, json);
+      workingModel = m;
+      return { out, model: m };
+    } catch (e) {
+      last = e;
+      if (e.status === 401 || e.status === 403 || e.status === 429) break; // clé invalide ou quota : inutile d'essayer d'autres modèles
+    }
+  }
+  throw last;
+}
+
 export default async (req) => {
+  // Diagnostic : GET /api/agent indique si la clé est configurée (sans jamais l'afficher)
+  if (req.method === "GET") {
+    const k = apiKey();
+    const diag = { ok: true, keyConfigured: !!k, keyLooksValid: /^gsk_/.test(k) || (k.length > 20 && !BASE_URL.includes("groq")), baseUrl: BASE_URL, model: MODEL };
+    if (k && new URL(req.url).searchParams.has("test")) {
+      try { const r = await callLLM("Réponds uniquement : OK", "test", false); diag.llmTest = "réussi"; diag.model = r.model; }
+      catch (e) { diag.llmTest = String(e.message || e).slice(0, 250); }
+    }
+    return Response.json(diag);
+  }
   if (req.method !== "POST") return Response.json({ ok: false, error: "POST uniquement" }, { status: 405 });
-  if (!process.env.LLM_API_KEY) return Response.json({ ok: false, error: "LLM_API_KEY non configurée" }, { status: 503 });
+  if (!apiKey()) return Response.json({ ok: false, error: "LLM_API_KEY non configurée" }, { status: 503 });
 
   let body;
   try { body = await req.json(); } catch { return Response.json({ ok: false, error: "JSON invalide" }, { status: 400 }); }
@@ -75,13 +111,14 @@ export default async (req) => {
   try {
     if (body.task === "parse") {
       const text = String(body.text || "").slice(0, 600);
-      const out = await callLLM(PARSE_PROMPT, text, true);
-      return Response.json({ ok: true, model: MODEL, data: JSON.parse(out) });
+      const { out, model } = await callLLM(PARSE_PROMPT, text, true);
+      const clean = out.replace(/^```(?:json)?\s*|\s*```$/g, "");
+      return Response.json({ ok: true, model, data: JSON.parse(clean) });
     }
     if (body.task === "explain") {
       const payload = JSON.stringify(body.payload || {}).slice(0, 4000);
-      const out = await callLLM(EXPLAIN_PROMPT, payload, false);
-      return Response.json({ ok: true, model: MODEL, text: out.trim() });
+      const { out, model } = await callLLM(EXPLAIN_PROMPT, payload, false);
+      return Response.json({ ok: true, model, text: out.trim() });
     }
     return Response.json({ ok: false, error: "tâche inconnue" }, { status: 400 });
   } catch (e) {
