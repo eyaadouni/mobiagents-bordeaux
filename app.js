@@ -224,6 +224,15 @@ function ruleParse(text) {
   if (!origine && !destination && rest.length >= 2) { origine = rest[0]; destination = rest[1]; }
   else if (!destination && rest.length) destination = rest[rest.length - 1];
   else if (!origine && rest.length) origine = rest[0];
+  // Lieux inconnus du référentiel : extraction « de X à Y » (le géocodage tranchera)
+  if (!origine || !destination) {
+    const fm = text.match(/\b(?:depuis|de|du|des|d')\s*(?:la |le |l')?(.+?)\s+(?:à|a|au|aux|vers|jusqu'à|jusqu'au|→|->)\s+(?:la |le |l')?(.+?)(?:[,.;!?]|\s+(?:et|mais|avec|il|je|en)\b|$)/i);
+    if (fm) { origine = origine || fm[1].trim(); destination = destination || fm[2].trim(); }
+    else {
+      const dm = text.match(/\b(?:à|au|vers|jusqu'à)\s+(?:la |le |l')?(.+?)(?:[,.;!?]|\s+(?:et|mais|avec|il|je|en)\b|$)/i);
+      if (dm && !destination) destination = dm[1].trim();
+    }
+  }
   const h = t.match(/\b(\d{1,2})\s*h\s*(\d{2})?\b/);
   return {
     origine, destination,
@@ -267,10 +276,57 @@ const labelOf = (k) => CRITERIA.find((c) => c.k === k)?.label || k;
 /* ------------------------------------------------------------------ */
 /* Agent 2 — Environnement                                             */
 /* ------------------------------------------------------------------ */
-async function geocode(q) {
+function lev(a, b) {
+  const m = a.length, n = b.length;
+  if (Math.abs(m - n) > 2) return 9;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[n];
+}
+const clean = (s) => norm(s).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+
+// Cherche le lieu parmi les noms des stations V³ (221 lieux réels), avec tolérance aux fautes de frappe
+function matchStation(q, list) {
+  const nq = clean(q).replace(/^(la|le|les|l) /, "");
+  if (nq.length < 3 || !list.length) return null;
+  let best = null;
+  for (const s of list) {
+    const ns = clean(s.name);
+    let score = null;
+    if (ns === nq) score = 0;
+    else if (nq.length >= 4 && (ns.startsWith(nq + " ") || ns.endsWith(" " + nq) || ns.includes(" " + nq + " "))) score = 1;
+    else {
+      const tol = nq.length >= 8 ? 2 : nq.length >= 5 ? 1 : 0;
+      if (tol) {
+        const d = Math.min(lev(nq, ns), ...ns.split(" ").filter((w) => w.length >= 4).map((w) => lev(nq, w)));
+        if (d <= tol) score = 1 + d;
+      }
+    }
+    if (score !== null && (!best || score < best.score)) best = { s, score };
+  }
+  return best && { name: best.s.name + " (station V³)", lat: best.s.lat, lon: best.s.lon, src: "V³" };
+}
+
+async function geocode(q, stationList = []) {
   if (!q) return null;
   const m = matchPlaces(q);
   if (m.length) return { name: m[0].place.n, lat: m[0].place.lat, lon: m[0].place.lon, src: "référentiel" };
+  const st = matchStation(q, stationList);
+  if (st) return st;
+  const inMetro = (p) => haversine(p, { lat: CENTER[0], lon: CENTER[1] }) < 30;
+  // Points d'intérêt, arrêts, quartiers : OpenStreetMap (Nominatim), limité à la métropole
+  try {
+    const j = await fetchJSON(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&accept-language=fr&bounded=1&viewbox=-0.80,44.97,-0.40,44.72&q=${encodeURIComponent(q)}`, {}, 7000);
+    if (j[0]) {
+      const p = { name: j[0].name || j[0].display_name.split(",")[0], lat: +j[0].lat, lon: +j[0].lon, src: "OpenStreetMap" };
+      if (inMetro(p)) return p;
+    }
+  } catch { /* source suivante */ }
+  // Adresses : Géoplateforme IGN (BAN)
   const urls = [
     `https://data.geopf.fr/geocodage/search?q=${encodeURIComponent(q)}&limit=1&lat=${CENTER[0]}&lon=${CENTER[1]}`,
     `https://api-adresse.data.gouv.fr/search/?q=${encodeURIComponent(q)}&limit=1&lat=${CENTER[0]}&lon=${CENTER[1]}`,
@@ -279,9 +335,9 @@ async function geocode(q) {
     try {
       const j = await fetchJSON(u, {}, 6000);
       const f = j.features?.[0];
-      if (!f) continue;
+      if (!f || (f.properties.score ?? 1) < 0.4) continue;
       const p = { name: f.properties.label, lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0], src: "Géoplateforme" };
-      if (haversine(p, { lat: CENTER[0], lon: CENTER[1] }) < 30) return p;
+      if (inMetro(p)) return p;
     } catch { /* source suivante */ }
   }
   return null;
@@ -340,7 +396,10 @@ async function agentEnvironment(req) {
   agentState("env", "work", "Géocodage, météo, V³, routage…");
   const origQ = req.origine || "Place de la Victoire";
   if (!req.origine) log("env", "Départ non précisé : Place de la Victoire retenue par défaut.", "warn");
-  const [o, d, weather, stations] = await Promise.all([geocode(origQ), geocode(req.destination), getWeather(), getStations()]);
+  const weatherP = getWeather();
+  const stations = await getStations();
+  const [o, d, weather] = await Promise.all([geocode(origQ, stations.list), geocode(req.destination, stations.list), weatherP]);
+  for (const [p, q] of [[o, origQ], [d, req.destination]]) if (p && p.src !== "référentiel") log("env", `« ${q} » localisé : ${p.name}${p.src === "V³" ? "" : " (" + p.src + ")"}.`);
   if (!o || !d) {
     agentState("env", "err", "Lieu introuvable");
     throw new Error(`Lieu non reconnu : ${!o ? origQ : req.destination || "(destination absente)"}`);
@@ -692,7 +751,7 @@ async function run() {
     $("#runinfo").textContent = `${fmt((performance.now() - t0) / 1000, 1)} s`;
   } catch (e) {
     log("sys", e.message, "warn");
-    $("#opts").innerHTML = `<div class="empty">${e.message}<br>Lieux reconnus : ${PLACES.map((p) => p.n).join(", ")} — ou une adresse de Bordeaux Métropole.</div>`;
+    $("#opts").innerHTML = `<div class="empty">${e.message}<br>Essayez un nom de lieu, d'arrêt ou de station V³, ou une adresse de Bordeaux Métropole (ex. « 351 cours de la Libération, Talence »).</div>`;
     ["pref", "env", "dec"].forEach((a) => { if ($("#ag-" + a).classList.contains("work")) agentState(a, "err"); });
   } finally { btn.disabled = false; }
 }
